@@ -82,7 +82,7 @@ configure() {
   API="http://127.0.0.1:${PORT}/api"
   AUTH="$(printf 'admin:%s' "$OWNCAST_ADMIN_PASSWORD" | base64 | tr -d '\n')"
   n=0
-  until wget -q -O /dev/null -T 5 "$API/status"; do
+  until wget -q -O /dev/null -T 5 "$API/status" 2>/dev/null; do
     n=$((n + 1)); [ "$n" -ge 120 ] && { log "Owncast did not answer; settings retried next start"; return 0; }
     sleep 1
   done
