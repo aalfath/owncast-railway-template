@@ -8,11 +8,11 @@
 #   * replaces the default admin password and stream key with the generated
 #     OWNCAST_ADMIN_PASSWORD and OWNCAST_STREAM_KEY before anything listens,
 #   * sets Owncast's server URL to the Railway domain,
-#   * runs Owncast as the unprivileged "owncast" user on the /app/data volume.
+#   * keeps all state on the /app/data volume (database, emoji, logs, HLS).
 # Each value is applied once per change of its Railway variable (a fingerprint
 # is kept on the volume), so a password or key changed later in Owncast's own
 # admin is not reverted by the next deploy. Owncast's exit code is passed
-# through, so Railway's ON_FAILURE policy restarts it after a crash.
+# through (it is exec'd as PID 1), so Railway's ON_FAILURE policy restarts it after a crash.
 set -eu
 
 DATA=/app/data
@@ -24,10 +24,6 @@ log() { printf 'railway-start: %s\n' "$*"; }
 fp() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 
 mkdir -p "$STATE"
-# Railway mounts volumes owned by root; Owncast runs as uid 101.
-if [ "$(stat -c %u "$DATA")" != "101" ] || [ "$(stat -c %u "$STATE")" != "101" ]; then
-  chown -R owncast:owncast "$DATA"
-fi
 
 # Never fall back to upstream's public defaults: if a variable was removed,
 # use a random value kept on the volume and say so in the log.
@@ -75,10 +71,18 @@ if [ -n "$SERVER_URL" ] && [ "$(cat "$STATE/server-url" 2>/dev/null || true)" !=
   NEW_URL=1
 fi
 
+# POST a JSON body to Owncast's admin API with busybox wget (exit 0 on 2xx only).
+post() {
+  wget -q -O /dev/null -T 10 \
+    --header "Authorization: Basic $AUTH" --header 'Content-Type: application/json' \
+    --post-data "$2" "$API/$1"
+}
+
 configure() {
-  api="http://127.0.0.1:${PORT}/api"
+  API="http://127.0.0.1:${PORT}/api"
+  AUTH="$(printf 'admin:%s' "$OWNCAST_ADMIN_PASSWORD" | base64 | tr -d '\n')"
   n=0
-  until curl -fsS -m 5 -o /dev/null "$api/status"; do
+  until wget -q -O /dev/null -T 5 "$API/status"; do
     n=$((n + 1)); [ "$n" -ge 120 ] && { log "Owncast did not answer; settings retried next start"; return 0; }
     sleep 1
   done
@@ -86,9 +90,7 @@ configure() {
   # non-zero if that fails, so a live API means it took effect.
   [ "$NEW_ADMIN" = 1 ] && printf '%s' "$ADMIN_FP" > "$STATE/admin-password.fp"
   if [ "$NEW_KEY" = 1 ]; then
-    if printf '{"value":[{"key":"%s","comment":"From the OWNCAST_STREAM_KEY Railway variable"}]}' "$OWNCAST_STREAM_KEY" |
-       curl -fsS -m 10 -o /dev/null -u "admin:$OWNCAST_ADMIN_PASSWORD" -H 'Content-Type: application/json' \
-         --data-binary @- "$api/admin/config/streamkeys"; then
+    if post admin/config/streamkeys "{\"value\":[{\"key\":\"$OWNCAST_STREAM_KEY\",\"comment\":\"From the OWNCAST_STREAM_KEY Railway variable\"}]}"; then
       printf '%s' "$KEY_FP" > "$STATE/stream-key.fp"
       log "stream key stored; the default key is gone"
     else
@@ -96,16 +98,13 @@ configure() {
     fi
   fi
   if [ "$NEW_URL" = 1 ]; then
-    if printf '{"value":"%s"}' "$SERVER_URL" |
-       curl -fsS -m 10 -o /dev/null -u "admin:$OWNCAST_ADMIN_PASSWORD" -H 'Content-Type: application/json' \
-         --data-binary @- "$api/admin/config/serverurl"; then
+    if post admin/config/serverurl "{\"value\":\"$SERVER_URL\"}"; then
       printf '%s' "$SERVER_URL" > "$STATE/server-url"
       log "server URL set to $SERVER_URL"
     else
       log "could not set the server URL; set it in Admin > Configuration > General"
     fi
   fi
-  chown -R owncast:owncast "$STATE" 2>/dev/null || true
 }
 
 if [ "$NEW_ADMIN" = 1 ] || [ "$NEW_KEY" = 1 ] || [ "$NEW_URL" = 1 ]; then
@@ -117,4 +116,4 @@ if [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ] && [ -n "${RAILWAY_TCP_PROXY_PORT:-}" 
 fi
 log "starting Owncast: web on port $PORT, RTMP on port $RTMP_PORT"
 cd /app
-exec su-exec owncast:owncast /app/owncast "$@"
+exec /app/owncast "$@"
